@@ -9,6 +9,7 @@ import com.twitter.finagle.http.{Method, Request, Response, Status}
 import java.time.Instant
 import java.time.ZoneOffset
 import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
 import java.util.UUID
 
 
@@ -57,7 +58,7 @@ class RestApiClient {
 object RestApiClient {
   case class Call(
     customerId: Int,
-    callId: UUID,
+    callId: String,
     startTimestamp: Long,
     endTimestamp: Long,
   )
@@ -76,7 +77,7 @@ object RestApiClient {
     date: String,
     maxConcurrentCalls: Int,
     timestamp: Long,
-    callIds: List[UUID],
+    callIds: List[String],
   )
   object MaxCallsResult {
     implicit val format = Json.format[MaxCallsResult]
@@ -94,9 +95,16 @@ object RestApiClient {
     val allCalls = Await.result(client.getDataset())
     val callsByCustomer = allCalls.callRecords.groupBy(_.customerId)
     val callsByCustomerAndDate = callsByCustomer.map { case (customerId, calls) =>
-      (customerId, calls.groupBy { call =>
-        formatTimestampToUTCDate(call.startTimestamp)
-      })
+      (customerId, calls.flatMap(c => getAllDatesInRange(c).map((_, c))).groupBy(_._1).view.mapValues(_.map(_._2)))
+    }
+    callsByCustomerAndDate.foreach { case (customerId, callsByDate) =>
+      println(s"Customer $customerId")
+      callsByDate.foreach { case (date, calls) =>
+        println(s"Date $date")
+        calls.foreach { call =>
+          println(s"Call ${call.callId}")
+        }
+      }
     }
     val maxConcurrentCallsByCustomerAndDate: List[MaxCallsResult] = callsByCustomerAndDate.flatMap { case (customerId, callsByDate) =>
       callsByDate.map { case (date, calls) =>
@@ -118,8 +126,41 @@ object RestApiClient {
     formatter.format(instant)
   }
 
+  def getAllDatesInRange(call: Call): List[String] = {
+    val startTime = call.startTimestamp
+    val stopTime = call.endTimestamp
+    val startDate = Instant.ofEpochMilli(startTime)
+      .atZone(ZoneOffset.UTC)
+      .toLocalDate
+
+    val endDate = Instant.ofEpochMilli(stopTime)
+      .atZone(ZoneOffset.UTC)
+      .toLocalDate
+
+    var numOfDays = ChronoUnit.DAYS.between(startDate, endDate).toInt
+
+    if (endDate.atStartOfDay(ZoneOffset.UTC).toInstant.equals(Instant.ofEpochMilli(stopTime))) {
+      numOfDays -= 1
+    }
+
+    if (numOfDays < 0) {
+      List(formatTimestampToUTCDate(startTime))
+    } else {
+      (0 to numOfDays).map { dayOffset =>
+        val currentTimestamp = startDate.plusDays(dayOffset)
+          .atStartOfDay(ZoneOffset.UTC)
+          .toInstant
+          .toEpochMilli
+
+        formatTimestampToUTCDate(currentTimestamp)
+      }.toList
+    }
+  }
+
+
   def findMaxConcurrentCalls(calls: List[Call]): (Long, Int, List[Call]) = {
     case class Event(time: Long, delta: Int, call: Call)
+    case class GroupedEvent(time: Long, delta: Int, callsToAdd: Set[Call], callsToRemove: Set[Call])
     case class State(time: Long, count: Int, activeCalls: Set[Call])
 
     val events = calls.flatMap { call =>
@@ -129,12 +170,16 @@ object RestApiClient {
       )
     }.sortBy(_.time)
 
-    val states = events.scanLeft(State(0L, 0, Set.empty[Call])) { (state, event) =>
-      val newActiveCalls = if (event.delta > 0) {
-        state.activeCalls + event.call
-      } else {
-        state.activeCalls - event.call
-      }
+    val eventsByTime = events.groupBy(_.time)
+    val groupedEvents = eventsByTime.map { case (time, events) =>
+      val callsToAdd = events.filter(_.delta == 1).map(_.call).toSet
+      val callsToRemove = events.filter(_.delta == -1).map(_.call).toSet
+      GroupedEvent(time, events.map(_.delta).sum, callsToAdd, callsToRemove)
+    }.toList.sortBy(_.time)
+
+    val states = groupedEvents.scanLeft(State(0L, 0, Set.empty[Call])) { (state, event) =>
+      val newActiveCalls =
+        state.activeCalls ++ event.callsToAdd -- event.callsToRemove
 
       State(
         time = event.time,
